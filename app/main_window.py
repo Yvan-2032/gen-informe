@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -29,7 +31,6 @@ from app.image_utils import is_image_loadable
 from app.models import (
     Issue,
     Report,
-    ReportProfile,
     SOURCE_LANGUAGES,
     ScreenshotEntry,
     TARGET_LANGUAGE,
@@ -38,28 +39,109 @@ from app.models import (
 )
 from app.storage import (
     REPORT_FILE_EXTENSION,
-    load_default_profile,
+    add_recent_report,
+    load_recent_reports,
     load_report_json,
-    save_default_profile,
+    save_recent_reports,
     save_report_json,
 )
 
 
-class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+class InitialDataDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Datos iniciales del informe")
+        self.setMinimumWidth(620)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        box = QGroupBox("Datos del informe")
+        form = QFormLayout(box)
+
+        self.game_name_input = QLineEdit()
+        self.translator_input = QLineEdit()
+        self.tester_input = QLineEdit()
+        self.source_language_input = QComboBox()
+        self.source_language_input.addItems(SOURCE_LANGUAGES)
+
+        self.target_language_input = QLineEdit(TARGET_LANGUAGE)
+        self.target_language_input.setReadOnly(True)
+
+        self.date_input = QDateEdit()
+        self.date_input.setCalendarPopup(True)
+        self.date_input.setDisplayFormat("yyyy-MM-dd")
+        self.date_input.setDate(QDate.currentDate())
+
+        form.addRow("Nombre del juego:", self.game_name_input)
+        form.addRow("Traductor:", self.translator_input)
+        form.addRow("Tester:", self.tester_input)
+        form.addRow("Idioma original:", self.source_language_input)
+        form.addRow("Idioma destino:", self.target_language_input)
+        form.addRow("Fecha:", self.date_input)
+
+        root.addWidget(box)
+
+        buttons = QWidget()
+        buttons_layout = QHBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.addStretch(1)
+
+        cancel_button = QPushButton("Cancelar")
+        create_button = QPushButton("Crear proyecto")
+        cancel_button.clicked.connect(self.reject)
+        create_button.clicked.connect(self._on_create_clicked)
+        buttons_layout.addWidget(cancel_button)
+        buttons_layout.addWidget(create_button)
+        root.addWidget(buttons)
+
+    def _on_create_clicked(self) -> None:
+        report = self.to_report()
+        if not report.game_name:
+            QMessageBox.warning(self, "Dato faltante", "Debes ingresar el nombre del juego.")
+            return
+        if not report.translator:
+            QMessageBox.warning(self, "Dato faltante", "Debes ingresar el traductor.")
+            return
+        if not report.tester:
+            QMessageBox.warning(self, "Dato faltante", "Debes ingresar el tester.")
+            return
+        self.accept()
+
+    def to_report(self) -> Report:
+        report = Report()
+        report.game_name = self.game_name_input.text().strip()
+        report.translator = self.translator_input.text().strip()
+        report.tester = self.tester_input.text().strip()
+        report.source_language = normalize_source_language(
+            self.source_language_input.currentText().strip()
+        )
+        report.target_language = normalize_target_language(
+            self.target_language_input.text().strip() or TARGET_LANGUAGE
+        )
+        report.report_date = self.date_input.date().toString("yyyy-MM-dd")
+        return report
+
+
+class ReportEditorWindow(QMainWindow):
+    def __init__(self, report: Report | None = None, project_path: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("QA Report Builder - Traducciones")
+        self.setWindowTitle("QA Report Builder - Editor")
         self.resize(1280, 820)
 
-        self.report = Report()
-        self.default_profile: ReportProfile | None = None
-        self.profile_ready = False
+        self.report = report if report is not None else Report()
+        self.project_path = project_path
         self.current_preview_path: str | None = None
 
         self._build_ui()
-        self._initialize_profile_and_report()
+        self._load_report_to_form()
         self._refresh_screenshots()
         self._refresh_preview()
+        if self.project_path:
+            self._update_title_with_path()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -85,11 +167,6 @@ class MainWindow(QMainWindow):
         load_json_action = QAction("Abrir informe...", self)
         load_json_action.triggered.connect(self.load_json_report)
         file_menu.addAction(load_json_action)
-
-        settings_menu = menubar.addMenu("Configuracion")
-        save_profile_action = QAction("Guardar datos iniciales", self)
-        save_profile_action.triggered.connect(self.save_initial_data)
-        settings_menu.addAction(save_profile_action)
 
     def _build_header_form(self) -> QGroupBox:
         box = QGroupBox("Datos del informe")
@@ -123,21 +200,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        self.btn_save_profile = QPushButton("Guardar datos iniciales")
         self.btn_new_report = QPushButton("Nuevo informe")
         self.btn_load_images = QPushButton("Cargar imagenes")
         self.btn_edit_screenshot = QPushButton("Editar captura")
         self.btn_delete_screenshot = QPushButton("Eliminar captura")
         self.btn_export = QPushButton("Exportar Word")
 
-        self.btn_save_profile.clicked.connect(self.save_initial_data)
         self.btn_new_report.clicked.connect(self.new_report)
         self.btn_load_images.clicked.connect(self.add_screenshots)
         self.btn_edit_screenshot.clicked.connect(self.edit_selected_screenshot)
         self.btn_delete_screenshot.clicked.connect(self.delete_selected_screenshot)
         self.btn_export.clicked.connect(self.export_to_word)
 
-        layout.addWidget(self.btn_save_profile)
         layout.addWidget(self.btn_new_report)
         layout.addWidget(self.btn_load_images)
         layout.addWidget(self.btn_edit_screenshot)
@@ -152,80 +226,6 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(self._build_right_panel())
         self.main_splitter.setSizes([320, 900])
         return self.main_splitter
-
-    def _initialize_profile_and_report(self) -> None:
-        try:
-            self.default_profile = load_default_profile()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(
-                self,
-                "Perfil invalido",
-                f"No se pudo cargar el perfil guardado.\nDetalle: {exc}",
-            )
-            self.default_profile = None
-
-        if self.default_profile is None:
-            self.profile_ready = False
-            self.report = Report()
-            self._load_report_to_form()
-            self._set_capture_ui_enabled(False)
-            QMessageBox.information(
-                self,
-                "Configura datos iniciales",
-                "Completa los datos del informe y pulsa 'Guardar datos iniciales'.\n"
-                "Luego ya no se volveran a pedir al iniciar.",
-            )
-            return
-
-        self.profile_ready = True
-        self.report = self.default_profile.to_report()
-        self._load_report_to_form()
-        self._set_capture_ui_enabled(True)
-
-    def _set_capture_ui_enabled(self, enabled: bool) -> None:
-        self.btn_new_report.setEnabled(enabled)
-        self.btn_load_images.setEnabled(enabled)
-        self.btn_edit_screenshot.setEnabled(enabled)
-        self.btn_delete_screenshot.setEnabled(enabled)
-        self.btn_export.setEnabled(enabled)
-        self.btn_add_issue.setEnabled(enabled)
-        self.btn_save_issue.setEnabled(enabled)
-        self.btn_delete_issue.setEnabled(enabled)
-        self.screenshot_list.setEnabled(enabled)
-        self.issue_list.setEnabled(enabled)
-        self.main_splitter.setEnabled(enabled)
-
-    def _validate_initial_data(self) -> str | None:
-        if not self.report.game_name:
-            return "Debes ingresar el nombre del juego."
-        if not self.report.translator:
-            return "Debes ingresar el traductor."
-        if not self.report.tester:
-            return "Debes ingresar el tester."
-        return None
-
-    def save_initial_data(self) -> None:
-        self._read_form_to_report()
-        error_message = self._validate_initial_data()
-        if error_message:
-            QMessageBox.warning(self, "Dato faltante", error_message)
-            return
-
-        try:
-            profile = ReportProfile.from_report(self.report)
-            profile_path = save_default_profile(profile)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Error", f"No se pudo guardar el perfil:\n{exc}")
-            return
-
-        self.default_profile = profile
-        self.profile_ready = True
-        self._set_capture_ui_enabled(True)
-        QMessageBox.information(
-            self,
-            "Datos guardados",
-            f"Datos iniciales guardados en:\n{profile_path}",
-        )
 
     def _build_left_panel(self) -> QWidget:
         widget = QWidget()
@@ -329,26 +329,18 @@ class MainWindow(QMainWindow):
         self.report.report_date = self.date_input.date().toString("yyyy-MM-dd")
 
     def new_report(self) -> None:
-        if not self.profile_ready:
-            QMessageBox.warning(
-                self,
-                "Perfil pendiente",
-                "Primero guarda los datos iniciales del informe.",
-            )
-            return
-
         answer = QMessageBox.question(
             self,
             "Nuevo informe",
-            "Se limpiaran los datos actuales. Continuar?",
+            "Se limpiaran capturas y errores del informe actual. Continuar?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
 
-        self.report = self.default_profile.to_report() if self.default_profile else Report()
+        self._read_form_to_report()
+        self.report.screenshots = []
         self.current_preview_path = None
-        self._load_report_to_form()
         self._refresh_screenshots()
         self._clear_issue_form()
         self.preview_label.setText("Selecciona una captura para vista previa")
@@ -551,7 +543,7 @@ class MainWindow(QMainWindow):
         out_path, _ = QFileDialog.getSaveFileName(
             self,
             "Guardar informe",
-            "",
+            self.project_path or "",
             f"Informe QA (*{REPORT_FILE_EXTENSION});;Archivo JSON (*.json)",
         )
         if not out_path:
@@ -567,6 +559,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"No se pudo guardar el informe:\n{exc}")
             return
 
+        self.project_path = out_path
+        self._update_title_with_path()
+        add_recent_report(out_path)
         QMessageBox.information(self, "Guardado", f"Informe guardado en:\n{out_path}")
 
     def load_json_report(self) -> None:
@@ -579,6 +574,9 @@ class MainWindow(QMainWindow):
         if not in_path:
             return
 
+        self._load_project_path(in_path)
+
+    def _load_project_path(self, in_path: str) -> None:
         try:
             report = load_report_json(in_path)
         except Exception as exc:  # noqa: BLE001
@@ -586,10 +584,19 @@ class MainWindow(QMainWindow):
             return
 
         self.report = report
+        self.project_path = in_path
+        self._update_title_with_path()
         self._load_report_to_form()
         self._refresh_screenshots()
         self._clear_issue_form()
         self._refresh_preview()
+        add_recent_report(in_path)
+
+    def _update_title_with_path(self) -> None:
+        if not self.project_path:
+            self.setWindowTitle("QA Report Builder - Editor")
+            return
+        self.setWindowTitle(f"QA Report Builder - Editor - {Path(self.project_path).name}")
 
     def _refresh_screenshots(self) -> None:
         self.screenshot_list.clear()
@@ -645,3 +652,178 @@ class MainWindow(QMainWindow):
         self.wrong_text_input.clear()
         self.correction_input.clear()
         self.note_input.clear()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("QA Report Builder")
+        self.resize(1180, 760)
+        self.editor_windows: list[ReportEditorWindow] = []
+        self.all_recent_paths: list[str] = []
+
+        self._build_ui()
+        self._load_recent_projects()
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        left = QWidget()
+        left.setFixedWidth(250)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(16, 20, 16, 16)
+        left_layout.setSpacing(14)
+
+        product_label = QLabel("QA Report Builder")
+        product_label.setStyleSheet("font-size: 20px; font-weight: 600;")
+        left_layout.addWidget(product_label)
+
+        self.nav_list = QListWidget()
+        self.nav_list.addItem("Projects")
+        self.nav_list.addItem("Iniciar sesion")
+        self.nav_list.setCurrentRow(0)
+        self.nav_list.currentRowChanged.connect(self._on_nav_changed)
+        left_layout.addWidget(self.nav_list, stretch=1)
+        left_layout.addStretch(1)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(12)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_projects_page())
+        self.stack.addWidget(self._build_login_page())
+        right_layout.addWidget(self.stack, stretch=1)
+
+        root.addWidget(left)
+        root.addWidget(right, stretch=1)
+        self.setCentralWidget(central)
+
+    def _build_projects_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        top_row = QWidget()
+        top_layout = QHBoxLayout(top_row)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Buscar proyectos")
+        self.search_input.textChanged.connect(self._filter_recent_projects)
+        self.btn_new_project = QPushButton("Nuevo proyecto")
+        self.btn_open_project = QPushButton("Abrir")
+        self.btn_new_project.clicked.connect(self._new_project)
+        self.btn_open_project.clicked.connect(self._open_existing_project)
+
+        top_layout.addWidget(self.search_input, stretch=1)
+        top_layout.addWidget(self.btn_new_project)
+        top_layout.addWidget(self.btn_open_project)
+
+        layout.addWidget(top_row)
+        layout.addWidget(QLabel("Testeos recientes"))
+
+        self.recent_list = QListWidget()
+        self.recent_list.itemDoubleClicked.connect(self._open_recent_item)
+        layout.addWidget(self.recent_list, stretch=1)
+        return page
+
+    def _build_login_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        title = QLabel("Iniciar sesion")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        description = QLabel("Vista solo visual. Aun no implementado.")
+        description.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addStretch(1)
+        return page
+
+    def _on_nav_changed(self, row: int) -> None:
+        if row < 0:
+            return
+        self.stack.setCurrentIndex(row)
+
+    def _load_recent_projects(self) -> None:
+        self.all_recent_paths = load_recent_reports()
+        self._filter_recent_projects()
+
+    def _filter_recent_projects(self) -> None:
+        query = self.search_input.text().strip().casefold()
+        self.recent_list.clear()
+
+        for raw_path in self.all_recent_paths:
+            p = Path(raw_path)
+            display_name = p.stem or p.name
+            full_path = str(p)
+            if query and query not in display_name.casefold() and query not in full_path.casefold():
+                continue
+
+            item = QListWidgetItem(f"{display_name}\n{full_path}")
+            item.setData(Qt.UserRole, full_path)
+            item.setToolTip(full_path)
+            self.recent_list.addItem(item)
+
+    def _new_project(self) -> None:
+        dialog = InitialDataDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        report = dialog.to_report()
+        self._open_editor(report=report, project_path=None)
+
+    def _open_existing_project(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Abrir informe",
+            "",
+            f"Informe QA (*{REPORT_FILE_EXTENSION});;Archivo JSON (*.json)",
+        )
+        if not file_path:
+            return
+        self._open_report_path(file_path)
+
+    def _open_recent_item(self, item: QListWidgetItem) -> None:
+        file_path = str(item.data(Qt.UserRole) or "").strip()
+        if not file_path:
+            return
+        self._open_report_path(file_path)
+
+    def _open_report_path(self, file_path: str) -> None:
+        try:
+            report = load_report_json(file_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Error", f"No se pudo abrir el informe:\n{exc}")
+            self._remove_recent_path(file_path)
+            return
+
+        add_recent_report(file_path)
+        self._open_editor(report=report, project_path=file_path)
+        self._load_recent_projects()
+
+    def _open_editor(self, report: Report, project_path: str | None) -> None:
+        editor = ReportEditorWindow(report=report, project_path=project_path)
+        self.editor_windows.append(editor)
+        editor.destroyed.connect(lambda _obj=None, win=editor: self._on_editor_closed(win))
+        editor.show()
+        editor.raise_()
+        editor.activateWindow()
+
+    def _on_editor_closed(self, win: ReportEditorWindow) -> None:
+        self.editor_windows = [w for w in self.editor_windows if w is not win]
+        self._load_recent_projects()
+
+    def _remove_recent_path(self, path: str) -> None:
+        updated = [p for p in self.all_recent_paths if p.casefold() != path.casefold()]
+        save_recent_reports(updated)
+        self.all_recent_paths = updated
+        self._filter_recent_projects()
