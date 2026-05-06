@@ -16,7 +16,7 @@ Instalacion:
 pip install -r requirements.txt
 ```
 
-Si quieres recrear el entorno exactamente con esta version:
+Si quieres recrear el entorno exactamente con esta version (Windows PowerShell):
 
 ```bash
 py -3.11 -m venv .venv
