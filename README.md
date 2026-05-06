@@ -24,10 +24,11 @@ python main.py
 
 ## Flujo principal
 
-1. Completar datos del informe en la parte superior.
-2. Cargar capturas con **Cargar imagenes**.
-3. Seleccionar una captura y agregar/editar/eliminar errores.
-4. Exportar con **Exportar Word**.
+1. Al iniciar por primera vez, completar datos del informe y pulsar **Guardar datos iniciales**.
+2. Esos datos quedan guardados localmente y se reutilizan automaticamente en los siguientes inicios.
+3. Cargar capturas con **Cargar imagenes**.
+4. Seleccionar una captura y agregar/editar/eliminar errores.
+5. Exportar con **Exportar Word**.
 
 ## Estructura
 
@@ -40,4 +41,5 @@ python main.py
 
 Extras:
 
-- Guardar/abrir informe en JSON desde menu **Archivo**.
+- Guardar/abrir informe desde menu **Archivo** en formato `*.iarc` (o `*.json` si prefieres).
+- Los datos iniciales se guardan como perfil local `*.qaprof`.

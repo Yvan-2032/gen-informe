@@ -29,13 +29,20 @@ from app.image_utils import is_image_loadable
 from app.models import (
     Issue,
     Report,
+    ReportProfile,
     SOURCE_LANGUAGES,
     ScreenshotEntry,
     TARGET_LANGUAGE,
     normalize_source_language,
     normalize_target_language,
 )
-from app.storage import load_report_json, save_report_json
+from app.storage import (
+    REPORT_FILE_EXTENSION,
+    load_default_profile,
+    load_report_json,
+    save_default_profile,
+    save_report_json,
+)
 
 
 class MainWindow(QMainWindow):
@@ -45,11 +52,14 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
 
         self.report = Report()
+        self.default_profile: ReportProfile | None = None
+        self.profile_ready = False
         self.current_preview_path: str | None = None
 
         self._build_ui()
-        self._load_report_to_form()
+        self._initialize_profile_and_report()
         self._refresh_screenshots()
+        self._refresh_preview()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -68,13 +78,18 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("Archivo")
 
-        save_json_action = QAction("Guardar JSON...", self)
+        save_json_action = QAction("Guardar informe...", self)
         save_json_action.triggered.connect(self.save_json_report)
         file_menu.addAction(save_json_action)
 
-        load_json_action = QAction("Abrir JSON...", self)
+        load_json_action = QAction("Abrir informe...", self)
         load_json_action.triggered.connect(self.load_json_report)
         file_menu.addAction(load_json_action)
+
+        settings_menu = menubar.addMenu("Configuracion")
+        save_profile_action = QAction("Guardar datos iniciales", self)
+        save_profile_action.triggered.connect(self.save_initial_data)
+        settings_menu.addAction(save_profile_action)
 
     def _build_header_form(self) -> QGroupBox:
         box = QGroupBox("Datos del informe")
@@ -108,18 +123,21 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
+        self.btn_save_profile = QPushButton("Guardar datos iniciales")
         self.btn_new_report = QPushButton("Nuevo informe")
         self.btn_load_images = QPushButton("Cargar imagenes")
         self.btn_edit_screenshot = QPushButton("Editar captura")
         self.btn_delete_screenshot = QPushButton("Eliminar captura")
         self.btn_export = QPushButton("Exportar Word")
 
+        self.btn_save_profile.clicked.connect(self.save_initial_data)
         self.btn_new_report.clicked.connect(self.new_report)
         self.btn_load_images.clicked.connect(self.add_screenshots)
         self.btn_edit_screenshot.clicked.connect(self.edit_selected_screenshot)
         self.btn_delete_screenshot.clicked.connect(self.delete_selected_screenshot)
         self.btn_export.clicked.connect(self.export_to_word)
 
+        layout.addWidget(self.btn_save_profile)
         layout.addWidget(self.btn_new_report)
         layout.addWidget(self.btn_load_images)
         layout.addWidget(self.btn_edit_screenshot)
@@ -129,11 +147,85 @@ class MainWindow(QMainWindow):
         return row
 
     def _build_main_splitter(self) -> QSplitter:
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_left_panel())
-        splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([320, 900])
-        return splitter
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(self._build_left_panel())
+        self.main_splitter.addWidget(self._build_right_panel())
+        self.main_splitter.setSizes([320, 900])
+        return self.main_splitter
+
+    def _initialize_profile_and_report(self) -> None:
+        try:
+            self.default_profile = load_default_profile()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                "Perfil invalido",
+                f"No se pudo cargar el perfil guardado.\nDetalle: {exc}",
+            )
+            self.default_profile = None
+
+        if self.default_profile is None:
+            self.profile_ready = False
+            self.report = Report()
+            self._load_report_to_form()
+            self._set_capture_ui_enabled(False)
+            QMessageBox.information(
+                self,
+                "Configura datos iniciales",
+                "Completa los datos del informe y pulsa 'Guardar datos iniciales'.\n"
+                "Luego ya no se volveran a pedir al iniciar.",
+            )
+            return
+
+        self.profile_ready = True
+        self.report = self.default_profile.to_report()
+        self._load_report_to_form()
+        self._set_capture_ui_enabled(True)
+
+    def _set_capture_ui_enabled(self, enabled: bool) -> None:
+        self.btn_new_report.setEnabled(enabled)
+        self.btn_load_images.setEnabled(enabled)
+        self.btn_edit_screenshot.setEnabled(enabled)
+        self.btn_delete_screenshot.setEnabled(enabled)
+        self.btn_export.setEnabled(enabled)
+        self.btn_add_issue.setEnabled(enabled)
+        self.btn_save_issue.setEnabled(enabled)
+        self.btn_delete_issue.setEnabled(enabled)
+        self.screenshot_list.setEnabled(enabled)
+        self.issue_list.setEnabled(enabled)
+        self.main_splitter.setEnabled(enabled)
+
+    def _validate_initial_data(self) -> str | None:
+        if not self.report.game_name:
+            return "Debes ingresar el nombre del juego."
+        if not self.report.translator:
+            return "Debes ingresar el traductor."
+        if not self.report.tester:
+            return "Debes ingresar el tester."
+        return None
+
+    def save_initial_data(self) -> None:
+        self._read_form_to_report()
+        error_message = self._validate_initial_data()
+        if error_message:
+            QMessageBox.warning(self, "Dato faltante", error_message)
+            return
+
+        try:
+            profile = ReportProfile.from_report(self.report)
+            profile_path = save_default_profile(profile)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Error", f"No se pudo guardar el perfil:\n{exc}")
+            return
+
+        self.default_profile = profile
+        self.profile_ready = True
+        self._set_capture_ui_enabled(True)
+        QMessageBox.information(
+            self,
+            "Datos guardados",
+            f"Datos iniciales guardados en:\n{profile_path}",
+        )
 
     def _build_left_panel(self) -> QWidget:
         widget = QWidget()
@@ -237,6 +329,14 @@ class MainWindow(QMainWindow):
         self.report.report_date = self.date_input.date().toString("yyyy-MM-dd")
 
     def new_report(self) -> None:
+        if not self.profile_ready:
+            QMessageBox.warning(
+                self,
+                "Perfil pendiente",
+                "Primero guarda los datos iniciales del informe.",
+            )
+            return
+
         answer = QMessageBox.question(
             self,
             "Nuevo informe",
@@ -246,7 +346,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        self.report = Report()
+        self.report = self.default_profile.to_report() if self.default_profile else Report()
         self.current_preview_path = None
         self._load_report_to_form()
         self._refresh_screenshots()
@@ -449,25 +549,32 @@ class MainWindow(QMainWindow):
     def save_json_report(self) -> None:
         self._read_form_to_report()
         out_path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar informe JSON", "", "Archivo JSON (*.json)"
+            self,
+            "Guardar informe",
+            "",
+            f"Informe QA (*{REPORT_FILE_EXTENSION});;Archivo JSON (*.json)",
         )
         if not out_path:
             return
 
-        if not out_path.lower().endswith(".json"):
-            out_path += ".json"
+        lowered_path = out_path.lower()
+        if not lowered_path.endswith(REPORT_FILE_EXTENSION) and not lowered_path.endswith(".json"):
+            out_path += REPORT_FILE_EXTENSION
 
         try:
             save_report_json(self.report, out_path)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Error", f"No se pudo guardar el JSON:\n{exc}")
+            QMessageBox.critical(self, "Error", f"No se pudo guardar el informe:\n{exc}")
             return
 
         QMessageBox.information(self, "Guardado", f"Informe guardado en:\n{out_path}")
 
     def load_json_report(self) -> None:
         in_path, _ = QFileDialog.getOpenFileName(
-            self, "Abrir informe JSON", "", "Archivo JSON (*.json)"
+            self,
+            "Abrir informe",
+            "",
+            f"Informe QA (*{REPORT_FILE_EXTENSION});;Archivo JSON (*.json)",
         )
         if not in_path:
             return
@@ -475,7 +582,7 @@ class MainWindow(QMainWindow):
         try:
             report = load_report_json(in_path)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Error", f"No se pudo abrir el JSON:\n{exc}")
+            QMessageBox.critical(self, "Error", f"No se pudo abrir el informe:\n{exc}")
             return
 
         self.report = report
