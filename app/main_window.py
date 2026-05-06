@@ -26,7 +26,15 @@ from PySide6.QtWidgets import (
 
 from app.docx_exporter import export_report_to_docx
 from app.image_utils import is_image_loadable
-from app.models import Issue, Report, SOURCE_LANGUAGES, ScreenshotEntry, TARGET_LANGUAGE
+from app.models import (
+    Issue,
+    Report,
+    SOURCE_LANGUAGES,
+    ScreenshotEntry,
+    TARGET_LANGUAGE,
+    normalize_source_language,
+    normalize_target_language,
+)
 from app.storage import load_report_json, save_report_json
 
 
@@ -205,8 +213,12 @@ class MainWindow(QMainWindow):
         self.game_name_input.setText(self.report.game_name)
         self.translator_input.setText(self.report.translator)
         self.tester_input.setText(self.report.tester)
-        self.source_language_input.setCurrentText(self.report.source_language)
-        self.target_language_input.setText(self.report.target_language)
+        self.source_language_input.setCurrentText(
+            normalize_source_language(self.report.source_language)
+        )
+        self.target_language_input.setText(
+            normalize_target_language(self.report.target_language)
+        )
         parsed_date = QDate.fromString(self.report.report_date, "yyyy-MM-dd")
         if not parsed_date.isValid():
             parsed_date = QDate.currentDate()
@@ -216,8 +228,12 @@ class MainWindow(QMainWindow):
         self.report.game_name = self.game_name_input.text().strip()
         self.report.translator = self.translator_input.text().strip()
         self.report.tester = self.tester_input.text().strip()
-        self.report.source_language = self.source_language_input.currentText().strip()
-        self.report.target_language = self.target_language_input.text().strip() or TARGET_LANGUAGE
+        self.report.source_language = normalize_source_language(
+            self.source_language_input.currentText().strip()
+        )
+        self.report.target_language = normalize_target_language(
+            self.target_language_input.text().strip() or TARGET_LANGUAGE
+        )
         self.report.report_date = self.date_input.date().toString("yyyy-MM-dd")
 
     def new_report(self) -> None:

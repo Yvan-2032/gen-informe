@@ -5,8 +5,40 @@ from datetime import date
 from typing import Any
 
 
-SOURCE_LANGUAGES = ["Ingles", "Chino", "Japones", "Mixto"]
-TARGET_LANGUAGE = "Espanol"
+SOURCE_LANGUAGES = ["Inglés", "Chino", "Japonés", "Mixto"]
+TARGET_LANGUAGE = "Español"
+
+_LANGUAGE_ALIASES = {
+    "ingles": "Inglés",
+    "inglés": "Inglés",
+    "chino": "Chino",
+    "japones": "Japonés",
+    "japonés": "Japonés",
+    "mixto": "Mixto",
+    "espanol": "Español",
+    "español": "Español",
+}
+
+
+def display_language(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    return _LANGUAGE_ALIASES.get(normalized.casefold(), normalized)
+
+
+def normalize_source_language(value: str) -> str:
+    normalized = display_language(value)
+    if normalized in SOURCE_LANGUAGES:
+        return normalized
+    return SOURCE_LANGUAGES[0]
+
+
+def normalize_target_language(value: str) -> str:
+    normalized = display_language(value)
+    if normalized == TARGET_LANGUAGE:
+        return normalized
+    return TARGET_LANGUAGE
 
 
 @dataclass
@@ -79,10 +111,65 @@ class Report:
             game_name=str(data.get("game_name", "")).strip(),
             translator=str(data.get("translator", "")).strip(),
             tester=str(data.get("tester", "")).strip(),
-            source_language=str(data.get("source_language", SOURCE_LANGUAGES[0])),
-            target_language=str(data.get("target_language", TARGET_LANGUAGE)),
+            source_language=normalize_source_language(
+                str(data.get("source_language", SOURCE_LANGUAGES[0]))
+            ),
+            target_language=normalize_target_language(
+                str(data.get("target_language", TARGET_LANGUAGE))
+            ),
             report_date=str(data.get("report_date", date.today().isoformat())),
             screenshots=[
                 ScreenshotEntry.from_dict(s) for s in screenshots_data if isinstance(s, dict)
             ],
+        )
+
+
+@dataclass
+class ReportProfile:
+    game_name: str = ""
+    translator: str = ""
+    tester: str = ""
+    source_language: str = SOURCE_LANGUAGES[0]
+    target_language: str = TARGET_LANGUAGE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "game_name": self.game_name,
+            "translator": self.translator,
+            "tester": self.tester,
+            "source_language": self.source_language,
+            "target_language": self.target_language,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReportProfile":
+        return cls(
+            game_name=str(data.get("game_name", "")).strip(),
+            translator=str(data.get("translator", "")).strip(),
+            tester=str(data.get("tester", "")).strip(),
+            source_language=normalize_source_language(
+                str(data.get("source_language", SOURCE_LANGUAGES[0]))
+            ),
+            target_language=normalize_target_language(
+                str(data.get("target_language", TARGET_LANGUAGE))
+            ),
+        )
+
+    @classmethod
+    def from_report(cls, report: Report) -> "ReportProfile":
+        return cls(
+            game_name=report.game_name,
+            translator=report.translator,
+            tester=report.tester,
+            source_language=normalize_source_language(report.source_language),
+            target_language=normalize_target_language(report.target_language),
+        )
+
+    def to_report(self) -> Report:
+        return Report(
+            game_name=self.game_name,
+            translator=self.translator,
+            tester=self.tester,
+            source_language=normalize_source_language(self.source_language),
+            target_language=normalize_target_language(self.target_language),
         )

@@ -29,3 +29,4 @@ logs/
 exports/
 temp/
 "@ | Set-Content .gitignore -Encoding UTF8
+/.pycache_tmp

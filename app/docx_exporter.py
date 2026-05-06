@@ -6,7 +6,7 @@ from docx import Document
 from docx.shared import Inches, RGBColor
 
 from app.image_utils import calculate_fit_size_inches
-from app.models import Issue, Report, ScreenshotEntry
+from app.models import Issue, Report, ScreenshotEntry, display_language
 
 
 def export_report_to_docx(report: Report, output_path: str) -> None:
@@ -22,8 +22,8 @@ def _add_cover_page(document: Document, report: Report) -> None:
     _add_label_value(document, "Juego", report.game_name)
     _add_label_value(document, "Traductor", report.translator)
     _add_label_value(document, "Tester", report.tester)
-    _add_label_value(document, "Idioma original", report.source_language)
-    _add_label_value(document, "Idioma destino", report.target_language)
+    _add_label_value(document, "Idioma original", display_language(report.source_language))
+    _add_label_value(document, "Idioma destino", display_language(report.target_language))
     _add_label_value(document, "Fecha", report.report_date)
 
     document.add_page_break()
