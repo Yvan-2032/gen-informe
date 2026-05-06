@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from docx import Document
 from docx.shared import Inches, RGBColor
 
@@ -9,11 +7,16 @@ from app.image_utils import calculate_fit_size_inches
 from app.models import Issue, Report, ScreenshotEntry, display_language
 
 
-def export_report_to_docx(report: Report, output_path: str) -> None:
+def export_report_to_docx(report: Report, output_path: str) -> list[str]:
     document = Document()
     _add_cover_page(document, report)
-    _add_screenshots(document, report)
+    skipped = _add_screenshots(document, report)
+    if not report.screenshots:
+        raise ValueError("No hay capturas para exportar.")
+    if len(skipped) == len(report.screenshots):
+        raise ValueError("No se pudo exportar ninguna captura al documento.")
     document.save(output_path)
+    return skipped
 
 
 def _add_cover_page(document: Document, report: Report) -> None:
@@ -29,25 +32,28 @@ def _add_cover_page(document: Document, report: Report) -> None:
     document.add_page_break()
 
 
-def _add_screenshots(document: Document, report: Report) -> None:
-    slots_remaining = 2
+def _add_label_value(document: Document, label: str, value: str) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.add_run(f"{label}: ").bold = True
+    paragraph.add_run(str(value or ""))
+
+
+def _add_screenshots(document: Document, report: Report) -> list[str]:
+    skipped: list[str] = []
     total = len(report.screenshots)
 
-    for index, shot in enumerate(report.screenshots):
+    for idx, shot in enumerate(report.screenshots):
         compact = _is_compact_entry(shot)
-        needed_slots = 1 if compact else 2
+        is_last_capture = idx == (total - 1)
 
-        if needed_slots > slots_remaining:
-            document.add_page_break()
-            slots_remaining = 2
-
-        _add_screenshot_block(document, index + 1, shot, compact=compact)
-        slots_remaining -= needed_slots
-
-        is_last = index == (total - 1)
-        if slots_remaining == 0 and not is_last:
-            document.add_page_break()
-            slots_remaining = 2
+        if not _add_screenshot_block(
+            document,
+            shot,
+            compact=compact,
+            is_last_capture=is_last_capture,
+        ):
+            skipped.append(shot.image_path)
+    return skipped
 
 
 def _is_compact_entry(entry: ScreenshotEntry) -> bool:
@@ -61,52 +67,55 @@ def _is_compact_entry(entry: ScreenshotEntry) -> bool:
 
 
 def _add_screenshot_block(
-    document: Document, index: int, entry: ScreenshotEntry, *, compact: bool
-) -> None:
-    image_name = Path(entry.image_path).name
-    heading = document.add_paragraph()
-    heading.paragraph_format.keep_with_next = True
-    heading_run = heading.add_run(f"Captura {index}: {image_name}")
-    heading_run.bold = True
-
+    document: Document,
+    entry: ScreenshotEntry,
+    *,
+    compact: bool,
+    is_last_capture: bool,
+) -> bool:
     max_width_in = 6.0
     max_height_in = 3.1 if compact else 5.0
-    width_in, height_in = calculate_fit_size_inches(entry.image_path, max_width_in, max_height_in)
+    try:
+        width_in, height_in = calculate_fit_size_inches(entry.image_path, max_width_in, max_height_in)
+    except OSError:
+        return False
 
-    pic_paragraph = document.add_paragraph()
-    pic_paragraph.paragraph_format.keep_with_next = True
-    pic_paragraph.add_run().add_picture(
-        entry.image_path, width=Inches(width_in), height=Inches(height_in)
-    )
+    try:
+        pic_paragraph = document.add_paragraph()
+        pic_paragraph.paragraph_format.keep_with_next = True
+        pic_paragraph.add_run().add_picture(
+            entry.image_path, width=Inches(width_in), height=Inches(height_in)
+        )
+    except Exception:  # noqa: BLE001
+        return False
 
     if not entry.issues:
         empty_paragraph = document.add_paragraph("Sin errores registrados.")
         empty_paragraph.runs[0].italic = True
-        return
+        return True
 
+    total_issues = len(entry.issues)
     for issue_idx, issue in enumerate(entry.issues, start=1):
         _add_issue_block(document, issue_idx, issue)
+        if issue_idx < total_issues:
+            document.add_paragraph("")
 
-    document.add_paragraph("")
+    if total_issues > 1 and not is_last_capture:
+        document.add_paragraph("")
+
+    return True
 
 
-def _add_issue_block(document: Document, issue_idx: int, issue: Issue) -> None:
-    title = document.add_paragraph()
-    title_run = title.add_run(f"Error {issue_idx}")
-    title_run.bold = True
-
+def _add_issue_block(document: Document, _issue_idx: int, issue: Issue) -> None:
     wrong_p = document.add_paragraph()
-    wrong_p.add_run("Texto erroneo: ").bold = True
     wrong_run = wrong_p.add_run(issue.wrong_text or "(vacio)")
     wrong_run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
 
     correction_p = document.add_paragraph()
-    correction_p.add_run("Correccion: ").bold = True
     correction_run = correction_p.add_run(issue.correction or "(vacio)")
     correction_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
 
     if issue.note.strip():
         note_p = document.add_paragraph()
-        note_p.add_run("Nota: ").bold = True
         note_run = note_p.add_run(issue.note.strip())
         note_run.font.color.rgb = RGBColor(0x00, 0x64, 0x00)

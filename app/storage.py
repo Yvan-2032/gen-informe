@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from app.models import Report, ReportProfile
@@ -23,6 +24,26 @@ def get_default_profile_path() -> Path:
 
 def _recents_path() -> Path:
     return _app_storage_dir() / _RECENTS_FILENAME
+
+
+def _normalize_recent_path(raw_path: str | Path) -> str:
+    value = str(raw_path).strip()
+    if not value:
+        return ""
+
+    path = Path(value).expanduser()
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normpath(str(resolved))
+
+
+def _recent_key(raw_path: str | Path) -> str:
+    normalized = _normalize_recent_path(raw_path)
+    if not normalized:
+        return ""
+    return os.path.normcase(normalized)
 
 
 def save_report_json(report: Report, file_path: str | Path) -> None:
@@ -74,7 +95,19 @@ def load_recent_reports() -> list[str]:
     recent = data.get("recent_reports", [])
     if not isinstance(recent, list):
         return []
-    return [str(item).strip() for item in recent if str(item).strip()]
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in recent:
+        normalized = _normalize_recent_path(item)
+        if not normalized:
+            continue
+        key = _recent_key(normalized)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(normalized)
+    return cleaned
 
 
 def save_recent_reports(paths: list[str]) -> None:
@@ -83,11 +116,11 @@ def save_recent_reports(paths: list[str]) -> None:
     cleaned: list[str] = []
     seen: set[str] = set()
     for raw in paths:
-        normalized = str(raw).strip()
+        normalized = _normalize_recent_path(raw)
         if not normalized:
             continue
-        key = normalized.casefold()
-        if key in seen:
+        key = _recent_key(normalized)
+        if not key or key in seen:
             continue
         seen.add(key)
         cleaned.append(normalized)
@@ -97,13 +130,17 @@ def save_recent_reports(paths: list[str]) -> None:
 
 
 def add_recent_report(file_path: str | Path) -> None:
-    normalized = str(file_path).strip()
+    normalized = _normalize_recent_path(file_path)
     if not normalized:
+        return
+
+    normalized_key = _recent_key(normalized)
+    if not normalized_key:
         return
 
     current = load_recent_reports()
     ordered = [normalized]
     for item in current:
-        if item.casefold() != normalized.casefold():
+        if _recent_key(item) != normalized_key:
             ordered.append(item)
     save_recent_reports(ordered)

@@ -5,18 +5,23 @@ from datetime import date
 from typing import Any
 
 
-SOURCE_LANGUAGES = ["Inglés", "Chino", "Japonés", "Mixto"]
+SOURCE_LANGUAGES = ["Inglés", "Chino simplificado", "Chino tradicional", "Japonés", "Mixto"]
 TARGET_LANGUAGE = "Español"
 
 _LANGUAGE_ALIASES = {
     "ingles": "Inglés",
     "inglés": "Inglés",
-    "chino": "Chino",
+    "inglã©s": "Inglés",
+    "chino": "Chino simplificado",
+    "chino simplificado": "Chino simplificado",
+    "chino tradicional": "Chino tradicional",
     "japones": "Japonés",
     "japonés": "Japonés",
+    "japonã©s": "Japonés",
     "mixto": "Mixto",
     "espanol": "Español",
     "español": "Español",
+    "espaã±ol": "Español",
 }
 
 
@@ -173,3 +178,4 @@ class ReportProfile:
             source_language=normalize_source_language(self.source_language),
             target_language=normalize_target_language(self.target_language),
         )
+

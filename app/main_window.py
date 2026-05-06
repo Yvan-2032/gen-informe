@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
-from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QAction, QPixmap
+from PIL import Image, UnidentifiedImageError
+from PySide6.QtCore import QDate, QObject, QPoint, QRect, QStandardPaths, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -36,6 +39,8 @@ from app.models import (
     normalize_source_language,
     normalize_target_language,
 )
+from app.ocr.base import OcrDependencyError, OcrModelLoadError, OcrRuntimeError
+from app.ocr.manager import get_last_ocr_warning, run_ocr
 from app.storage import (
     REPORT_FILE_EXTENSION,
     add_recent_report,
@@ -44,6 +49,236 @@ from app.storage import (
     save_recent_reports,
     save_report_json,
 )
+
+
+class SelectionPreviewLabel(QLabel):
+    selectionCompleted = Signal(QRect)
+    selectionCancelled = Signal()
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._source_pixmap: QPixmap | None = None
+        self._display_rect = QRect()
+        self._selection_mode = False
+        self._drag_origin: QPoint | None = None
+        self._selection_rect = QRect()
+        self.setMouseTracking(True)
+
+    def has_image(self) -> bool:
+        return self._source_pixmap is not None and not self._source_pixmap.isNull()
+
+    def set_source_pixmap(self, pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            self._source_pixmap = None
+            return
+        self._source_pixmap = QPixmap(pixmap)
+        self._selection_mode = False
+        self._drag_origin = None
+        self._selection_rect = QRect()
+        self.setText("")
+        self.update()
+
+    def clear_source(self, message: str) -> None:
+        self._source_pixmap = None
+        self.cancel_selection_mode(silent=True)
+        self.setText(message)
+        self.update()
+
+    def begin_selection_mode(self) -> bool:
+        if not self.has_image():
+            return False
+        self._selection_mode = True
+        self._drag_origin = None
+        self._selection_rect = QRect()
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+        return True
+
+    def cancel_selection_mode(self, *, silent: bool = False) -> None:
+        was_active = self._selection_mode
+        self._selection_mode = False
+        self._drag_origin = None
+        self._selection_rect = QRect()
+        self.unsetCursor()
+        self.update()
+        if was_active and not silent:
+            self.selectionCancelled.emit()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if not self.has_image():
+            self._display_rect = QRect()
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self._display_rect = self._calculate_display_rect()
+        if self._display_rect.isValid():
+            painter.drawPixmap(self._display_rect, self._source_pixmap)
+
+        if self._selection_mode and self._selection_rect.isValid():
+            normalized = self._selection_rect.normalized()
+            painter.fillRect(normalized, QColor(0, 120, 215, 55))
+            painter.setPen(QPen(QColor(0, 170, 255), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(normalized)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if not self._selection_mode:
+            super().mousePressEvent(event)
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self._display_rect.contains(event.position().toPoint()):
+            return
+        self._drag_origin = self._clamp_to_display_rect(event.position().toPoint())
+        self._selection_rect = QRect(self._drag_origin, self._drag_origin)
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if not self._selection_mode:
+            super().mouseMoveEvent(event)
+            return
+        if self._drag_origin is None:
+            return
+        current = self._clamp_to_display_rect(event.position().toPoint())
+        self._selection_rect = QRect(self._drag_origin, current).normalized()
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if not self._selection_mode:
+            super().mouseReleaseEvent(event)
+            return
+        if event.button() != Qt.MouseButton.LeftButton or self._drag_origin is None:
+            return
+
+        end_point = self._clamp_to_display_rect(event.position().toPoint())
+        selected = QRect(self._drag_origin, end_point).normalized().intersected(self._display_rect)
+        self._drag_origin = None
+
+        if selected.width() < 4 or selected.height() < 4:
+            self.cancel_selection_mode(silent=False)
+            return
+
+        image_rect = self._map_display_to_image_rect(selected)
+        self.cancel_selection_mode(silent=True)
+        if image_rect.width() < 2 or image_rect.height() < 2:
+            self.selectionCancelled.emit()
+            return
+        self.selectionCompleted.emit(image_rect)
+
+    def _calculate_display_rect(self) -> QRect:
+        if not self.has_image():
+            return QRect()
+        source_size = self._source_pixmap.size()
+        if source_size.width() <= 0 or source_size.height() <= 0:
+            return QRect()
+        scaled_size = source_size.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        x = (self.width() - scaled_size.width()) // 2
+        y = (self.height() - scaled_size.height()) // 2
+        return QRect(x, y, scaled_size.width(), scaled_size.height())
+
+    def _clamp_to_display_rect(self, point: QPoint) -> QPoint:
+        x = min(max(point.x(), self._display_rect.left()), self._display_rect.right())
+        y = min(max(point.y(), self._display_rect.top()), self._display_rect.bottom())
+        return QPoint(x, y)
+
+    def _map_display_to_image_rect(self, selected_rect: QRect) -> QRect:
+        if not self.has_image() or not self._display_rect.isValid():
+            return QRect()
+
+        pixmap_w = self._source_pixmap.width()
+        pixmap_h = self._source_pixmap.height()
+        disp_w = self._display_rect.width()
+        disp_h = self._display_rect.height()
+        if disp_w <= 0 or disp_h <= 0:
+            return QRect()
+
+        x1 = (selected_rect.left() - self._display_rect.left()) / disp_w * pixmap_w
+        y1 = (selected_rect.top() - self._display_rect.top()) / disp_h * pixmap_h
+        x2 = (selected_rect.right() + 1 - self._display_rect.left()) / disp_w * pixmap_w
+        y2 = (selected_rect.bottom() + 1 - self._display_rect.top()) / disp_h * pixmap_h
+
+        left = max(0, min(pixmap_w - 1, int(x1)))
+        top = max(0, min(pixmap_h - 1, int(y1)))
+        right = max(left + 1, min(pixmap_w, int(x2)))
+        bottom = max(top + 1, min(pixmap_h, int(y2)))
+        return QRect(left, top, right - left, bottom - top)
+
+
+class OcrResultDialog(QDialog):
+    def __init__(self, recognized_text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Resultado OCR")
+        self.setMinimumSize(560, 360)
+        self._build_ui(recognized_text)
+
+    def _build_ui(self, recognized_text: str) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        root.addWidget(QLabel("Texto reconocido (editable):"))
+        self.text_editor = QTextEdit()
+        self.text_editor.setPlainText(recognized_text)
+        root.addWidget(self.text_editor, stretch=1)
+
+        buttons = QWidget()
+        buttons_layout = QHBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.addStretch(1)
+
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_copy = QPushButton("Copiar")
+        self.btn_use = QPushButton("Usar como Texto erróneo")
+
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_copy.clicked.connect(self._copy_text)
+        self.btn_use.clicked.connect(self.accept)
+
+        buttons_layout.addWidget(self.btn_cancel)
+        buttons_layout.addWidget(self.btn_copy)
+        buttons_layout.addWidget(self.btn_use)
+        root.addWidget(buttons)
+
+    def _copy_text(self) -> None:
+        QApplication.clipboard().setText(self.text_editor.toPlainText())
+
+    def selected_text(self) -> str:
+        return self.text_editor.toPlainText().strip()
+
+
+class OcrWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+    warning = Signal(str)
+    completed = Signal()
+
+    def __init__(self, image_path: str, source_language: str) -> None:
+        super().__init__()
+        self.image_path = image_path
+        self.source_language = source_language
+
+    def run(self) -> None:
+        try:
+            text = run_ocr(self.image_path, self.source_language)
+            last_warning = get_last_ocr_warning()
+            if last_warning:
+                self.warning.emit(last_warning)
+            self.finished.emit(text)
+        except OcrDependencyError as exc:
+            self.failed.emit(f"OCR no instalado correctamente:\n{exc}")
+        except OcrModelLoadError as exc:
+            self.failed.emit(f"No se pudo cargar el modelo OCR:\n{exc}")
+        except OcrRuntimeError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"Error interno del OCR:\n{exc}")
+        finally:
+            self.completed.emit()
 
 
 class InitialDataDialog(QDialog):
@@ -147,6 +382,9 @@ class ReportEditorWindow(QMainWindow):
         self.report = report if report is not None else Report()
         self.project_path = project_path
         self.current_preview_path: str | None = None
+        self._ocr_thread: QThread | None = None
+        self._ocr_worker: OcrWorker | None = None
+        self._ocr_runtime_dir = Path("runtime") / "ocr_crops"
 
         self._build_ui()
         self._refresh_screenshots()
@@ -170,9 +408,13 @@ class ReportEditorWindow(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("Archivo")
 
-        save_json_action = QAction("Guardar informe...", self)
+        save_json_action = QAction("Guardar", self)
         save_json_action.triggered.connect(self.save_json_report)
         file_menu.addAction(save_json_action)
+
+        save_json_as_action = QAction("Guardar como...", self)
+        save_json_as_action.triggered.connect(self.save_json_report_as)
+        file_menu.addAction(save_json_as_action)
 
         load_json_action = QAction("Abrir informe...", self)
         load_json_action.triggered.connect(self.load_json_report)
@@ -181,6 +423,28 @@ class ReportEditorWindow(QMainWindow):
         edit_header_action = QAction("Editar datos del informe...", self)
         edit_header_action.triggered.connect(self.edit_report_data)
         file_menu.addAction(edit_header_action)
+
+    def _default_save_dir(self) -> str:
+        if self.project_path:
+            return self.project_path
+        docs_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        return docs_dir or ""
+
+    def _default_docx_path(self) -> str:
+        docs_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        default_dir = Path(docs_dir) if docs_dir else Path.cwd()
+
+        if self.project_path:
+            project_ref = Path(self.project_path)
+            base_name = project_ref.stem
+            target_dir = project_ref.parent
+        else:
+            base_name = self.report.game_name.strip() if self.report.game_name else "proyecto"
+            target_dir = default_dir
+
+        safe_name = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in base_name)
+        safe_name = safe_name.strip("_") or "proyecto"
+        return str(target_dir / f"{safe_name}_informe_testeo.docx")
 
     def _build_buttons_row(self) -> QWidget:
         row = QWidget()
@@ -192,18 +456,21 @@ class ReportEditorWindow(QMainWindow):
         self.btn_load_images = QPushButton("Cargar imagenes")
         self.btn_edit_screenshot = QPushButton("Editar captura")
         self.btn_delete_screenshot = QPushButton("Eliminar captura")
+        self.btn_ocr_selection = QPushButton("OCR por seleccion")
         self.btn_export = QPushButton("Exportar Word")
 
         self.btn_new_report.clicked.connect(self.new_report)
         self.btn_load_images.clicked.connect(self.add_screenshots)
         self.btn_edit_screenshot.clicked.connect(self.edit_selected_screenshot)
         self.btn_delete_screenshot.clicked.connect(self.delete_selected_screenshot)
+        self.btn_ocr_selection.clicked.connect(self.start_ocr_selection)
         self.btn_export.clicked.connect(self.export_to_word)
 
         layout.addWidget(self.btn_new_report)
         layout.addWidget(self.btn_load_images)
         layout.addWidget(self.btn_edit_screenshot)
         layout.addWidget(self.btn_delete_screenshot)
+        layout.addWidget(self.btn_ocr_selection)
         layout.addStretch(1)
         layout.addWidget(self.btn_export)
         return row
@@ -236,12 +503,14 @@ class ReportEditorWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        self.preview_label = QLabel("Selecciona una captura para vista previa")
+        self.preview_label = SelectionPreviewLabel("Selecciona una captura para vista previa")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumHeight(300)
         self.preview_label.setStyleSheet(
             "border: 1px solid #666; background-color: #111; color: #ddd; padding: 8px;"
         )
+        self.preview_label.selectionCompleted.connect(self._on_ocr_selection_completed)
+        self.preview_label.selectionCancelled.connect(self._on_ocr_selection_cancelled)
 
         layout.addWidget(QLabel("Vista previa"))
         layout.addWidget(self.preview_label, stretch=1)
@@ -320,8 +589,7 @@ class ReportEditorWindow(QMainWindow):
         self.current_preview_path = None
         self._refresh_screenshots()
         self._clear_issue_form()
-        self.preview_label.setText("Selecciona una captura para vista previa")
-        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.clear_source("Selecciona una captura para vista previa")
 
     def add_screenshots(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -399,6 +667,7 @@ class ReportEditorWindow(QMainWindow):
         self.screenshot_list.setCurrentRow(idx)
 
     def on_screenshot_selected(self, row: int) -> None:
+        self.preview_label.cancel_selection_mode(silent=True)
         self._refresh_issues_for_screenshot(row)
         self._refresh_preview()
         self._clear_issue_form()
@@ -484,6 +753,145 @@ class ReportEditorWindow(QMainWindow):
         self._refresh_issues_for_screenshot(shot_idx)
         self._clear_issue_form()
 
+    def start_ocr_selection(self) -> None:
+        if self._ocr_thread is not None and self._ocr_thread.isRunning():
+            QMessageBox.information(self, "OCR en progreso", "Espera a que termine el OCR actual.")
+            return
+
+        shot_idx = self.screenshot_list.currentRow()
+        if shot_idx < 0:
+            QMessageBox.warning(self, "Sin captura", "Selecciona una captura primero.")
+            return
+        if shot_idx >= len(self.report.screenshots):
+            QMessageBox.warning(self, "Sin captura", "La captura seleccionada no es valida.")
+            return
+
+        image_path = self.report.screenshots[shot_idx].image_path
+        if not is_image_loadable(image_path):
+            QMessageBox.warning(self, "Imagen invalida", "No se pudo cargar la captura seleccionada.")
+            return
+        if not self.preview_label.begin_selection_mode():
+            QMessageBox.warning(self, "Vista previa", "No hay vista previa disponible para OCR.")
+            return
+
+        self.statusBar().showMessage(
+            "Modo OCR activo: dibuja un rectangulo sobre el texto a reconocer."
+        )
+
+    def _on_ocr_selection_cancelled(self) -> None:
+        self.statusBar().clearMessage()
+
+    def _on_ocr_selection_completed(self, image_rect: QRect) -> None:
+        if image_rect.width() < 12 or image_rect.height() < 12:
+            QMessageBox.warning(
+                self,
+                "Seleccion pequena",
+                "La seleccion es demasiado pequena para OCR. Intenta con un area mayor.",
+            )
+            self.statusBar().clearMessage()
+            return
+
+        shot_idx = self.screenshot_list.currentRow()
+        if shot_idx < 0 or shot_idx >= len(self.report.screenshots):
+            QMessageBox.warning(self, "Sin captura", "No hay captura seleccionada para OCR.")
+            self.statusBar().clearMessage()
+            return
+
+        source_image_path = self.report.screenshots[shot_idx].image_path
+        if not is_image_loadable(source_image_path):
+            QMessageBox.warning(self, "Imagen invalida", "No se pudo cargar la imagen para recortar.")
+            self.statusBar().clearMessage()
+            return
+
+        try:
+            crop_path = self._save_ocr_crop(source_image_path, image_rect)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Seleccion invalida", str(exc))
+            self.statusBar().clearMessage()
+            return
+        except (OSError, UnidentifiedImageError) as exc:
+            QMessageBox.critical(self, "Error", f"No se pudo recortar la imagen:\n{exc}")
+            self.statusBar().clearMessage()
+            return
+
+        self._start_ocr_worker(crop_path)
+
+    def _save_ocr_crop(self, source_image_path: str, image_rect: QRect) -> Path:
+        self._ocr_runtime_dir.mkdir(parents=True, exist_ok=True)
+        crop_path = self._ocr_runtime_dir / f"ocr_crop_{uuid4().hex}.png"
+
+        left = int(image_rect.left())
+        top = int(image_rect.top())
+        right = left + int(image_rect.width())
+        bottom = top + int(image_rect.height())
+        if right <= left or bottom <= top:
+            raise ValueError("La seleccion debe tener ancho y alto mayores a cero.")
+
+        with Image.open(source_image_path) as image:
+            image_w, image_h = image.size
+            left = max(0, min(image_w - 1, left))
+            top = max(0, min(image_h - 1, top))
+            right = max(left + 1, min(image_w, right))
+            bottom = max(top + 1, min(image_h, bottom))
+            if right - left < 2 or bottom - top < 2:
+                raise ValueError("La seleccion es demasiado pequena para OCR.")
+            crop = image.crop((left, top, right, bottom))
+            crop.save(crop_path, format="PNG")
+        return crop_path
+
+    def _start_ocr_worker(self, crop_path: Path) -> None:
+        self._set_ocr_busy(True)
+        self.statusBar().showMessage("Procesando OCR...")
+
+        thread = QThread(self)
+        worker = OcrWorker(str(crop_path), self.report.source_language)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_ocr_finished)
+        worker.failed.connect(self._on_ocr_failed)
+        worker.warning.connect(self._on_ocr_warning)
+        worker.completed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_ocr_thread_finished)
+
+        self._ocr_thread = thread
+        self._ocr_worker = worker
+        thread.start()
+
+    def _on_ocr_warning(self, message: str) -> None:
+        QMessageBox.information(self, "OCR", message)
+
+    def _on_ocr_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "OCR", message)
+
+    def _on_ocr_finished(self, text: str) -> None:
+        self.statusBar().clearMessage()
+        dialog = OcrResultDialog(text, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        selected_text = dialog.selected_text()
+        if not selected_text:
+            QMessageBox.information(
+                self, "OCR", "No se aplico texto porque el resultado esta vacio."
+            )
+            return
+        self.wrong_text_input.setPlainText(selected_text)
+
+    def _on_ocr_thread_finished(self) -> None:
+        self._set_ocr_busy(False)
+        self.statusBar().clearMessage()
+        self._ocr_worker = None
+        self._ocr_thread = None
+
+    def _set_ocr_busy(self, is_busy: bool) -> None:
+        self.btn_ocr_selection.setEnabled(not is_busy)
+        self.btn_add_issue.setEnabled(not is_busy)
+        self.btn_save_issue.setEnabled(not is_busy)
+        self.btn_delete_issue.setEnabled(not is_busy)
+
     def export_to_word(self) -> None:
         if not self.report.game_name:
             QMessageBox.warning(self, "Dato faltante", "Debes ingresar el nombre del juego.")
@@ -493,7 +901,10 @@ class ReportEditorWindow(QMainWindow):
             return
 
         out_path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar informe Word", "", "Documento Word (*.docx)"
+            self,
+            "Guardar informe Word",
+            self._default_docx_path(),
+            "Documento Word (*.docx)",
         )
         if not out_path:
             return
@@ -502,7 +913,7 @@ class ReportEditorWindow(QMainWindow):
             out_path += ".docx"
 
         try:
-            export_report_to_docx(self.report, out_path)
+            skipped_paths = export_report_to_docx(self.report, out_path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(
                 self,
@@ -511,13 +922,37 @@ class ReportEditorWindow(QMainWindow):
             )
             return
 
+        if skipped_paths:
+            skipped = "\n- ".join(Path(path).name for path in skipped_paths)
+            QMessageBox.warning(
+                self,
+                "Exportacion completada con omisiones",
+                f"Informe exportado:\n{out_path}\n\n"
+                f"Se omitieron {len(skipped_paths)} capturas invalidas o no disponibles:\n- {skipped}",
+            )
+            return
         QMessageBox.information(self, "Exportacion completada", f"Informe exportado:\n{out_path}")
 
     def save_json_report(self) -> None:
+        if not self.project_path:
+            self.save_json_report_as()
+            return
+
+        try:
+            save_report_json(self.report, self.project_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Error", f"No se pudo guardar el informe:\n{exc}")
+            return
+
+        self._update_title_with_path()
+        add_recent_report(self.project_path)
+        QMessageBox.information(self, "Guardado", f"Informe guardado en:\n{self.project_path}")
+
+    def save_json_report_as(self) -> None:
         out_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Guardar informe",
-            self.project_path or "",
+            "Guardar informe como",
+            self._default_save_dir(),
             f"Informe QA (*{REPORT_FILE_EXTENSION});;Archivo JSON (*.json)",
         )
         if not out_path:
@@ -599,27 +1034,19 @@ class ReportEditorWindow(QMainWindow):
     def _refresh_preview(self) -> None:
         shot_idx = self.screenshot_list.currentRow()
         if shot_idx < 0 or shot_idx >= len(self.report.screenshots):
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("Selecciona una captura para vista previa")
+            self.preview_label.clear_source("Selecciona una captura para vista previa")
             self.current_preview_path = None
             return
 
         image_path = self.report.screenshots[shot_idx].image_path
         pixmap = QPixmap(image_path)
         if pixmap.isNull():
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("No se pudo cargar la vista previa de esta imagen")
+            self.preview_label.clear_source("No se pudo cargar la vista previa de esta imagen")
             self.current_preview_path = None
             return
 
         self.current_preview_path = image_path
-        scaled = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.preview_label.setText("")
-        self.preview_label.setPixmap(scaled)
+        self.preview_label.set_source_pixmap(pixmap)
 
     def _clear_issue_form(self) -> None:
         self.wrong_text_input.clear()
@@ -731,6 +1158,14 @@ class MainWindow(QMainWindow):
         self.all_recent_paths = load_recent_reports()
         self._filter_recent_projects()
 
+    def _path_key(self, raw_path: str) -> str:
+        candidate = Path(str(raw_path).strip()).expanduser()
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            resolved = candidate.absolute()
+        return str(resolved).casefold()
+
     def _filter_recent_projects(self) -> None:
         query = self.search_input.text().strip().casefold()
         self.recent_list.clear()
@@ -753,7 +1188,6 @@ class MainWindow(QMainWindow):
             return
         report = dialog.to_report()
         self._open_editor(report=report, project_path=None)
-        self.close()
 
     def _open_existing_project(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -786,18 +1220,25 @@ class MainWindow(QMainWindow):
 
     def _open_editor(self, report: Report, project_path: str | None) -> None:
         editor = ReportEditorWindow(report=report, project_path=project_path)
+        editor.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.editor_windows.append(editor)
         editor.destroyed.connect(lambda _obj=None, win=editor: self._on_editor_closed(win))
         editor.show()
         editor.raise_()
         editor.activateWindow()
+        self.hide()
 
     def _on_editor_closed(self, win: ReportEditorWindow) -> None:
         self.editor_windows = [w for w in self.editor_windows if w is not win]
         self._load_recent_projects()
+        if not self.editor_windows:
+            self.show()
+            self.raise_()
+            self.activateWindow()
 
     def _remove_recent_path(self, path: str) -> None:
-        updated = [p for p in self.all_recent_paths if p.casefold() != path.casefold()]
+        path_key = self._path_key(path)
+        updated = [p for p in self.all_recent_paths if self._path_key(p) != path_key]
         save_recent_reports(updated)
         self.all_recent_paths = updated
         self._filter_recent_projects()
