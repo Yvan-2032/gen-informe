@@ -35,8 +35,10 @@ python main.py
 1. Al iniciar, se muestra una pantalla tipo launcher con seccion **Projects**.
 2. En el panel izquierdo estan **Projects** e **Iniciar sesion** (visual).
 3. En **Projects**, usa **Nuevo proyecto** para abrir el popup con datos iniciales.
-4. Luego se abre el editor para cargar capturas y registrar errores.
-5. Exportar con **Exportar Word**.
+   La fecha no se ingresa: se toma automaticamente del dia actual.
+4. Luego se abre el editor y el launcher se cierra.
+5. En el editor, los datos del informe no se editan directo; se cambian desde **Archivo > Editar datos del informe...**.
+6. Exportar con **Exportar Word**.
 
 ## Estructura
 

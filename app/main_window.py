@@ -6,7 +6,6 @@ from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
-    QDateEdit,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -48,10 +47,18 @@ from app.storage import (
 
 
 class InitialDataDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        initial_report: Report | None = None,
+        submit_label: str = "Crear proyecto",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Datos iniciales del informe")
         self.setMinimumWidth(620)
+        self.submit_label = submit_label
+        self.initial_report = initial_report
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -71,17 +78,11 @@ class InitialDataDialog(QDialog):
         self.target_language_input = QLineEdit(TARGET_LANGUAGE)
         self.target_language_input.setReadOnly(True)
 
-        self.date_input = QDateEdit()
-        self.date_input.setCalendarPopup(True)
-        self.date_input.setDisplayFormat("yyyy-MM-dd")
-        self.date_input.setDate(QDate.currentDate())
-
         form.addRow("Nombre del juego:", self.game_name_input)
         form.addRow("Traductor:", self.translator_input)
         form.addRow("Tester:", self.tester_input)
         form.addRow("Idioma original:", self.source_language_input)
         form.addRow("Idioma destino:", self.target_language_input)
-        form.addRow("Fecha:", self.date_input)
 
         root.addWidget(box)
 
@@ -91,12 +92,23 @@ class InitialDataDialog(QDialog):
         buttons_layout.addStretch(1)
 
         cancel_button = QPushButton("Cancelar")
-        create_button = QPushButton("Crear proyecto")
+        create_button = QPushButton(self.submit_label)
         cancel_button.clicked.connect(self.reject)
         create_button.clicked.connect(self._on_create_clicked)
         buttons_layout.addWidget(cancel_button)
         buttons_layout.addWidget(create_button)
         root.addWidget(buttons)
+
+        if self.initial_report is not None:
+            self.game_name_input.setText(self.initial_report.game_name)
+            self.translator_input.setText(self.initial_report.translator)
+            self.tester_input.setText(self.initial_report.tester)
+            self.source_language_input.setCurrentText(
+                normalize_source_language(self.initial_report.source_language)
+            )
+            self.target_language_input.setText(
+                normalize_target_language(self.initial_report.target_language)
+            )
 
     def _on_create_clicked(self) -> None:
         report = self.to_report()
@@ -122,7 +134,7 @@ class InitialDataDialog(QDialog):
         report.target_language = normalize_target_language(
             self.target_language_input.text().strip() or TARGET_LANGUAGE
         )
-        report.report_date = self.date_input.date().toString("yyyy-MM-dd")
+        report.report_date = QDate.currentDate().toString("yyyy-MM-dd")
         return report
 
 
@@ -137,7 +149,6 @@ class ReportEditorWindow(QMainWindow):
         self.current_preview_path: str | None = None
 
         self._build_ui()
-        self._load_report_to_form()
         self._refresh_screenshots()
         self._refresh_preview()
         if self.project_path:
@@ -150,7 +161,6 @@ class ReportEditorWindow(QMainWindow):
         root.setSpacing(10)
 
         self._build_toolbar_actions()
-        root.addWidget(self._build_header_form())
         root.addWidget(self._build_buttons_row())
         root.addWidget(self._build_main_splitter(), stretch=1)
 
@@ -168,31 +178,9 @@ class ReportEditorWindow(QMainWindow):
         load_json_action.triggered.connect(self.load_json_report)
         file_menu.addAction(load_json_action)
 
-    def _build_header_form(self) -> QGroupBox:
-        box = QGroupBox("Datos del informe")
-        form = QFormLayout(box)
-
-        self.game_name_input = QLineEdit()
-        self.translator_input = QLineEdit()
-        self.tester_input = QLineEdit()
-
-        self.source_language_input = QComboBox()
-        self.source_language_input.addItems(SOURCE_LANGUAGES)
-
-        self.target_language_input = QLineEdit(TARGET_LANGUAGE)
-        self.target_language_input.setReadOnly(True)
-
-        self.date_input = QDateEdit()
-        self.date_input.setCalendarPopup(True)
-        self.date_input.setDisplayFormat("yyyy-MM-dd")
-
-        form.addRow("Nombre del juego:", self.game_name_input)
-        form.addRow("Traductor:", self.translator_input)
-        form.addRow("Tester:", self.tester_input)
-        form.addRow("Idioma original:", self.source_language_input)
-        form.addRow("Idioma destino:", self.target_language_input)
-        form.addRow("Fecha:", self.date_input)
-        return box
+        edit_header_action = QAction("Editar datos del informe...", self)
+        edit_header_action.triggered.connect(self.edit_report_data)
+        file_menu.addAction(edit_header_action)
 
     def _build_buttons_row(self) -> QWidget:
         row = QWidget()
@@ -301,32 +289,22 @@ class ReportEditorWindow(QMainWindow):
         super().resizeEvent(event)
         self._refresh_preview()
 
-    def _load_report_to_form(self) -> None:
-        self.game_name_input.setText(self.report.game_name)
-        self.translator_input.setText(self.report.translator)
-        self.tester_input.setText(self.report.tester)
-        self.source_language_input.setCurrentText(
-            normalize_source_language(self.report.source_language)
+    def edit_report_data(self) -> None:
+        dialog = InitialDataDialog(
+            self,
+            initial_report=self.report,
+            submit_label="Guardar cambios",
         )
-        self.target_language_input.setText(
-            normalize_target_language(self.report.target_language)
-        )
-        parsed_date = QDate.fromString(self.report.report_date, "yyyy-MM-dd")
-        if not parsed_date.isValid():
-            parsed_date = QDate.currentDate()
-        self.date_input.setDate(parsed_date)
+        if dialog.exec() != QDialog.Accepted:
+            return
 
-    def _read_form_to_report(self) -> None:
-        self.report.game_name = self.game_name_input.text().strip()
-        self.report.translator = self.translator_input.text().strip()
-        self.report.tester = self.tester_input.text().strip()
-        self.report.source_language = normalize_source_language(
-            self.source_language_input.currentText().strip()
-        )
-        self.report.target_language = normalize_target_language(
-            self.target_language_input.text().strip() or TARGET_LANGUAGE
-        )
-        self.report.report_date = self.date_input.date().toString("yyyy-MM-dd")
+        updated = dialog.to_report()
+        self.report.game_name = updated.game_name
+        self.report.translator = updated.translator
+        self.report.tester = updated.tester
+        self.report.source_language = updated.source_language
+        self.report.target_language = updated.target_language
+        self.report.report_date = updated.report_date
 
     def new_report(self) -> None:
         answer = QMessageBox.question(
@@ -338,7 +316,6 @@ class ReportEditorWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        self._read_form_to_report()
         self.report.screenshots = []
         self.current_preview_path = None
         self._refresh_screenshots()
@@ -508,8 +485,6 @@ class ReportEditorWindow(QMainWindow):
         self._clear_issue_form()
 
     def export_to_word(self) -> None:
-        self._read_form_to_report()
-
         if not self.report.game_name:
             QMessageBox.warning(self, "Dato faltante", "Debes ingresar el nombre del juego.")
             return
@@ -539,7 +514,6 @@ class ReportEditorWindow(QMainWindow):
         QMessageBox.information(self, "Exportacion completada", f"Informe exportado:\n{out_path}")
 
     def save_json_report(self) -> None:
-        self._read_form_to_report()
         out_path, _ = QFileDialog.getSaveFileName(
             self,
             "Guardar informe",
@@ -586,7 +560,6 @@ class ReportEditorWindow(QMainWindow):
         self.report = report
         self.project_path = in_path
         self._update_title_with_path()
-        self._load_report_to_form()
         self._refresh_screenshots()
         self._clear_issue_form()
         self._refresh_preview()
@@ -780,6 +753,7 @@ class MainWindow(QMainWindow):
             return
         report = dialog.to_report()
         self._open_editor(report=report, project_path=None)
+        self.close()
 
     def _open_existing_project(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
