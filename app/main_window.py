@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 from PySide6.QtCore import QDate, QObject, QPoint, QRect, QStandardPaths, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QGuiApplication, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -209,48 +210,6 @@ class SelectionPreviewLabel(QLabel):
         return QRect(left, top, right - left, bottom - top)
 
 
-class OcrResultDialog(QDialog):
-    def __init__(self, recognized_text: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Resultado OCR")
-        self.setMinimumSize(560, 360)
-        self._build_ui(recognized_text)
-
-    def _build_ui(self, recognized_text: str) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
-
-        root.addWidget(QLabel("Texto reconocido (editable):"))
-        self.text_editor = QTextEdit()
-        self.text_editor.setPlainText(recognized_text)
-        root.addWidget(self.text_editor, stretch=1)
-
-        buttons = QWidget()
-        buttons_layout = QHBoxLayout(buttons)
-        buttons_layout.setContentsMargins(0, 0, 0, 0)
-        buttons_layout.addStretch(1)
-
-        self.btn_cancel = QPushButton("Cancelar")
-        self.btn_copy = QPushButton("Copiar")
-        self.btn_use = QPushButton("Usar como Texto erróneo")
-
-        self.btn_cancel.clicked.connect(self.reject)
-        self.btn_copy.clicked.connect(self._copy_text)
-        self.btn_use.clicked.connect(self.accept)
-
-        buttons_layout.addWidget(self.btn_cancel)
-        buttons_layout.addWidget(self.btn_copy)
-        buttons_layout.addWidget(self.btn_use)
-        root.addWidget(buttons)
-
-    def _copy_text(self) -> None:
-        QApplication.clipboard().setText(self.text_editor.toPlainText())
-
-    def selected_text(self) -> str:
-        return self.text_editor.toPlainText().strip()
-
-
 class OcrWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
@@ -279,6 +238,75 @@ class OcrWorker(QObject):
             self.failed.emit(f"Error interno del OCR:\n{exc}")
         finally:
             self.completed.emit()
+
+
+class ScreenSnipDialog(QDialog):
+    def __init__(self, desktop_pixmap: QPixmap, virtual_rect: QRect, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._desktop_pixmap = desktop_pixmap
+        self._virtual_rect = virtual_rect
+        self._drag_origin: QPoint | None = None
+        self._selection_rect = QRect()
+        self._selected_rect = QRect()
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setModal(True)
+        self.setGeometry(virtual_rect)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setMouseTracking(True)
+
+    def selected_rect(self) -> QRect:
+        return self._selected_rect
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.drawPixmap(self.rect(), self._desktop_pixmap)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 90))
+
+        if self._selection_rect.isValid():
+            selection = self._selection_rect.normalized().intersected(self.rect())
+            if selection.isValid():
+                painter.drawPixmap(selection, self._desktop_pixmap, selection)
+                painter.setPen(QPen(QColor(0, 170, 255), 2, Qt.PenStyle.SolidLine))
+                painter.drawRect(selection)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._drag_origin = event.position().toPoint()
+        self._selection_rect = QRect(self._drag_origin, self._drag_origin)
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_origin is None:
+            return
+        current = event.position().toPoint()
+        self._selection_rect = QRect(self._drag_origin, current).normalized().intersected(self.rect())
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton or self._drag_origin is None:
+            return
+        current = event.position().toPoint()
+        selection = QRect(self._drag_origin, current).normalized().intersected(self.rect())
+        self._drag_origin = None
+        if selection.width() < 6 or selection.height() < 6:
+            self._selection_rect = QRect()
+            self.update()
+            return
+        self._selection_rect = selection
+        self._selected_rect = selection
+        self.accept()
 
 
 class InitialDataDialog(QDialog):
@@ -409,10 +437,12 @@ class ReportEditorWindow(QMainWindow):
         file_menu = menubar.addMenu("Archivo")
 
         save_json_action = QAction("Guardar", self)
+        save_json_action.setShortcut(QKeySequence.StandardKey.Save)
         save_json_action.triggered.connect(self.save_json_report)
         file_menu.addAction(save_json_action)
 
         save_json_as_action = QAction("Guardar como...", self)
+        save_json_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         save_json_as_action.triggered.connect(self.save_json_report_as)
         file_menu.addAction(save_json_as_action)
 
@@ -454,6 +484,7 @@ class ReportEditorWindow(QMainWindow):
 
         self.btn_new_report = QPushButton("Nuevo informe")
         self.btn_load_images = QPushButton("Cargar imagenes")
+        self.btn_capture_screen = QPushButton("Capturar pantalla")
         self.btn_edit_screenshot = QPushButton("Editar captura")
         self.btn_delete_screenshot = QPushButton("Eliminar captura")
         self.btn_ocr_selection = QPushButton("OCR por seleccion")
@@ -461,6 +492,7 @@ class ReportEditorWindow(QMainWindow):
 
         self.btn_new_report.clicked.connect(self.new_report)
         self.btn_load_images.clicked.connect(self.add_screenshots)
+        self.btn_capture_screen.clicked.connect(self.capture_screen_image)
         self.btn_edit_screenshot.clicked.connect(self.edit_selected_screenshot)
         self.btn_delete_screenshot.clicked.connect(self.delete_selected_screenshot)
         self.btn_ocr_selection.clicked.connect(self.start_ocr_selection)
@@ -468,6 +500,7 @@ class ReportEditorWindow(QMainWindow):
 
         layout.addWidget(self.btn_new_report)
         layout.addWidget(self.btn_load_images)
+        layout.addWidget(self.btn_capture_screen)
         layout.addWidget(self.btn_edit_screenshot)
         layout.addWidget(self.btn_delete_screenshot)
         layout.addWidget(self.btn_ocr_selection)
@@ -503,22 +536,48 @@ class ReportEditorWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
+        self.right_splitter = QSplitter(Qt.Vertical)
+
+        preview_box = QWidget()
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(8)
+
         self.preview_label = SelectionPreviewLabel("Selecciona una captura para vista previa")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(300)
+        self.preview_label.setMinimumHeight(360)
         self.preview_label.setStyleSheet(
             "border: 1px solid #666; background-color: #111; color: #ddd; padding: 8px;"
         )
         self.preview_label.selectionCompleted.connect(self._on_ocr_selection_completed)
         self.preview_label.selectionCancelled.connect(self._on_ocr_selection_cancelled)
 
-        layout.addWidget(QLabel("Vista previa"))
-        layout.addWidget(self.preview_label, stretch=1)
-        layout.addWidget(QLabel("Errores de la captura"))
+        preview_layout.addWidget(QLabel("Vista previa"))
+        preview_layout.addWidget(self.preview_label, stretch=1)
 
-        self.issue_list = QListWidget()
-        self.issue_list.currentRowChanged.connect(self.on_issue_selected)
-        layout.addWidget(self.issue_list, stretch=1)
+        details_box = QWidget()
+        details_layout = QVBoxLayout(details_box)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(8)
+
+        details_layout.addWidget(QLabel("Errores de la captura"))
+
+        issue_nav_row = QWidget()
+        issue_nav_layout = QHBoxLayout(issue_nav_row)
+        issue_nav_layout.setContentsMargins(0, 0, 0, 0)
+        issue_nav_layout.setSpacing(8)
+
+        self.btn_prev_issue = QPushButton("Anterior")
+        self.issue_selector = QComboBox()
+        self.btn_next_issue = QPushButton("Siguiente")
+        self.issue_selector.currentIndexChanged.connect(self.on_issue_selected)
+        self.btn_prev_issue.clicked.connect(self.select_previous_issue)
+        self.btn_next_issue.clicked.connect(self.select_next_issue)
+
+        issue_nav_layout.addWidget(self.btn_prev_issue)
+        issue_nav_layout.addWidget(self.issue_selector, stretch=1)
+        issue_nav_layout.addWidget(self.btn_next_issue)
+        details_layout.addWidget(issue_nav_row)
 
         form_box = QGroupBox("Detalle de error")
         form_layout = QFormLayout(form_box)
@@ -532,7 +591,7 @@ class ReportEditorWindow(QMainWindow):
         form_layout.addRow("Texto erroneo:", self.wrong_text_input)
         form_layout.addRow("Correccion:", self.correction_input)
         form_layout.addRow("Nota (opcional):", self.note_input)
-        layout.addWidget(form_box)
+        details_layout.addWidget(form_box)
 
         buttons = QWidget()
         buttons_layout = QHBoxLayout(buttons)
@@ -551,7 +610,16 @@ class ReportEditorWindow(QMainWindow):
         buttons_layout.addWidget(self.btn_save_issue)
         buttons_layout.addWidget(self.btn_delete_issue)
 
-        layout.addWidget(buttons)
+        details_layout.addWidget(buttons)
+
+        self.right_splitter.addWidget(preview_box)
+        self.right_splitter.addWidget(details_box)
+        self.right_splitter.setSizes([500, 500])
+        self.right_splitter.setStretchFactor(0, 1)
+        self.right_splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(self.right_splitter, stretch=1)
+        self._update_issue_selector_state(0, -1)
         return widget
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
@@ -601,19 +669,19 @@ class ReportEditorWindow(QMainWindow):
         if not files:
             return
 
+        initial_count = len(self.report.screenshots)
         invalid_files: list[str] = []
-        added = 0
         for file_path in files:
             if is_image_loadable(file_path):
-                self.report.screenshots.append(ScreenshotEntry(image_path=file_path))
-                added += 1
+                self._append_screenshot(file_path)
             else:
                 invalid_files.append(Path(file_path).name)
 
-        self._refresh_screenshots()
-
-        if added > 0 and self.screenshot_list.currentRow() < 0:
-            self.screenshot_list.setCurrentRow(0)
+        added = len(self.report.screenshots) - initial_count
+        if added > 0:
+            self._refresh_screenshots(preferred_row=len(self.report.screenshots) - 1)
+        else:
+            self._refresh_screenshots()
 
         if invalid_files:
             QMessageBox.warning(
@@ -621,6 +689,74 @@ class ReportEditorWindow(QMainWindow):
                 "Imagenes ignoradas",
                 "No se pudieron cargar estas imagenes:\n- " + "\n- ".join(invalid_files),
             )
+
+    def capture_screen_image(self) -> None:
+        self.hide()
+        QApplication.processEvents()
+
+        try:
+            captured, virtual_rect = self._grab_virtual_desktop()
+            if captured.isNull() or not virtual_rect.isValid():
+                QMessageBox.critical(self, "Captura", "No se pudo obtener la captura de pantalla.")
+                return
+
+            snip_dialog = ScreenSnipDialog(captured, virtual_rect, None)
+            if snip_dialog.exec() != QDialog.Accepted:
+                self.statusBar().showMessage("Captura cancelada.", 2000)
+                return
+
+            selected = snip_dialog.selected_rect()
+            if selected.width() < 6 or selected.height() < 6:
+                QMessageBox.warning(self, "Captura", "La seleccion es demasiado pequena.")
+                return
+
+            captured = captured.copy(selected)
+            if captured.isNull():
+                QMessageBox.critical(self, "Captura", "No se pudo recortar la captura seleccionada.")
+                return
+
+            out_dir = Path("runtime") / "screen_captures"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = out_dir / f"screen_capture_{timestamp}.png"
+            if not captured.save(str(out_path), "PNG"):
+                QMessageBox.critical(self, "Captura", "No se pudo guardar la captura en disco.")
+                return
+
+            self._append_screenshot(str(out_path))
+            self._refresh_screenshots(preferred_row=len(self.report.screenshots) - 1)
+            self.statusBar().showMessage(f"Captura agregada: {out_path.name}", 3000)
+        finally:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def _grab_virtual_desktop(self) -> tuple[QPixmap, QRect]:
+        screens = QGuiApplication.screens()
+        if not screens:
+            return QPixmap(), QRect()
+
+        virtual_rect = QRect()
+        for screen in screens:
+            virtual_rect = virtual_rect.united(screen.geometry())
+
+        if not virtual_rect.isValid() or virtual_rect.width() <= 0 or virtual_rect.height() <= 0:
+            return QPixmap(), QRect()
+
+        canvas = QPixmap(virtual_rect.size())
+        canvas.fill(Qt.GlobalColor.black)
+        painter = QPainter(canvas)
+        for screen in screens:
+            shot = screen.grabWindow(0)
+            if shot.isNull():
+                continue
+            offset = screen.geometry().topLeft() - virtual_rect.topLeft()
+            painter.drawPixmap(offset, shot)
+        painter.end()
+        return canvas, virtual_rect
+
+    def _append_screenshot(self, image_path: str) -> None:
+        self.report.screenshots.append(ScreenshotEntry(image_path=image_path))
 
     def delete_selected_screenshot(self) -> None:
         idx = self.screenshot_list.currentRow()
@@ -670,7 +806,8 @@ class ReportEditorWindow(QMainWindow):
         self.preview_label.cancel_selection_mode(silent=True)
         self._refresh_issues_for_screenshot(row)
         self._refresh_preview()
-        self._clear_issue_form()
+        if self.issue_selector.count() == 0:
+            self._clear_issue_form()
 
     def on_issue_selected(self, row: int) -> None:
         shot_idx = self.screenshot_list.currentRow()
@@ -684,6 +821,18 @@ class ReportEditorWindow(QMainWindow):
         self.wrong_text_input.setPlainText(issue.wrong_text)
         self.correction_input.setPlainText(issue.correction)
         self.note_input.setPlainText(issue.note)
+        self._update_issue_selector_state(len(self.report.screenshots[shot_idx].issues), row)
+
+    def select_previous_issue(self) -> None:
+        current = self.issue_selector.currentIndex()
+        if current > 0:
+            self.issue_selector.setCurrentIndex(current - 1)
+
+    def select_next_issue(self) -> None:
+        current = self.issue_selector.currentIndex()
+        total = self.issue_selector.count()
+        if 0 <= current < (total - 1):
+            self.issue_selector.setCurrentIndex(current + 1)
 
     def add_issue(self) -> None:
         shot_idx = self.screenshot_list.currentRow()
@@ -706,11 +855,11 @@ class ReportEditorWindow(QMainWindow):
             Issue(wrong_text=wrong, correction=correction, note=note)
         )
         self._refresh_issues_for_screenshot(shot_idx)
-        self.issue_list.setCurrentRow(len(self.report.screenshots[shot_idx].issues) - 1)
+        self.issue_selector.setCurrentIndex(len(self.report.screenshots[shot_idx].issues) - 1)
 
     def save_issue_changes(self) -> None:
         shot_idx = self.screenshot_list.currentRow()
-        issue_idx = self.issue_list.currentRow()
+        issue_idx = self.issue_selector.currentIndex()
 
         if shot_idx < 0:
             QMessageBox.warning(self, "Sin captura", "Selecciona una captura primero.")
@@ -736,11 +885,11 @@ class ReportEditorWindow(QMainWindow):
         issue.note = note
 
         self._refresh_issues_for_screenshot(shot_idx)
-        self.issue_list.setCurrentRow(issue_idx)
+        self.issue_selector.setCurrentIndex(issue_idx)
 
     def delete_issue(self) -> None:
         shot_idx = self.screenshot_list.currentRow()
-        issue_idx = self.issue_list.currentRow()
+        issue_idx = self.issue_selector.currentIndex()
 
         if shot_idx < 0:
             QMessageBox.warning(self, "Sin captura", "Selecciona una captura primero.")
@@ -751,7 +900,12 @@ class ReportEditorWindow(QMainWindow):
 
         self.report.screenshots[shot_idx].issues.pop(issue_idx)
         self._refresh_issues_for_screenshot(shot_idx)
-        self._clear_issue_form()
+        remaining = len(self.report.screenshots[shot_idx].issues)
+        if remaining <= 0:
+            self._clear_issue_form()
+            return
+        next_idx = min(issue_idx, remaining - 1)
+        self.issue_selector.setCurrentIndex(next_idx)
 
     def start_ocr_selection(self) -> None:
         if self._ocr_thread is not None and self._ocr_thread.isRunning():
@@ -844,7 +998,7 @@ class ReportEditorWindow(QMainWindow):
         self.statusBar().showMessage("Procesando OCR...")
 
         thread = QThread(self)
-        worker = OcrWorker(str(crop_path), self.report.source_language)
+        worker = OcrWorker(str(crop_path), self.report.target_language)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -868,17 +1022,14 @@ class ReportEditorWindow(QMainWindow):
 
     def _on_ocr_finished(self, text: str) -> None:
         self.statusBar().clearMessage()
-        dialog = OcrResultDialog(text, self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-
-        selected_text = dialog.selected_text()
+        selected_text = str(text or "").strip()
         if not selected_text:
             QMessageBox.information(
                 self, "OCR", "No se aplico texto porque el resultado esta vacio."
             )
             return
         self.wrong_text_input.setPlainText(selected_text)
+        self.statusBar().showMessage("Texto OCR aplicado en 'Texto erroneo'.", 3000)
 
     def _on_ocr_thread_finished(self) -> None:
         self._set_ocr_busy(False)
@@ -888,9 +1039,19 @@ class ReportEditorWindow(QMainWindow):
 
     def _set_ocr_busy(self, is_busy: bool) -> None:
         self.btn_ocr_selection.setEnabled(not is_busy)
+        self.btn_capture_screen.setEnabled(not is_busy)
         self.btn_add_issue.setEnabled(not is_busy)
         self.btn_save_issue.setEnabled(not is_busy)
         self.btn_delete_issue.setEnabled(not is_busy)
+        if is_busy:
+            self.btn_prev_issue.setEnabled(False)
+            self.btn_next_issue.setEnabled(False)
+            self.issue_selector.setEnabled(False)
+            return
+        self._update_issue_selector_state(
+            self.issue_selector.count(),
+            self.issue_selector.currentIndex(),
+        )
 
     def export_to_word(self) -> None:
         if not self.report.game_name:
@@ -1006,7 +1167,8 @@ class ReportEditorWindow(QMainWindow):
             return
         self.setWindowTitle(f"QA Report Builder - Editor - {Path(self.project_path).name}")
 
-    def _refresh_screenshots(self) -> None:
+    def _refresh_screenshots(self, preferred_row: int | None = None) -> None:
+        previous_row = self.screenshot_list.currentRow()
         self.screenshot_list.clear()
         for idx, shot in enumerate(self.report.screenshots, start=1):
             name = Path(shot.image_path).name
@@ -1015,13 +1177,22 @@ class ReportEditorWindow(QMainWindow):
             self.screenshot_list.addItem(item)
 
         if self.report.screenshots:
-            self.screenshot_list.setCurrentRow(0)
+            target_row = 0
+            if preferred_row is not None and 0 <= preferred_row < len(self.report.screenshots):
+                target_row = preferred_row
+            elif 0 <= previous_row < len(self.report.screenshots):
+                target_row = previous_row
+            self.screenshot_list.setCurrentRow(target_row)
         else:
-            self.issue_list.clear()
+            self.issue_selector.clear()
+            self._update_issue_selector_state(0, -1)
 
     def _refresh_issues_for_screenshot(self, shot_idx: int) -> None:
-        self.issue_list.clear()
+        self.issue_selector.blockSignals(True)
+        self.issue_selector.clear()
         if shot_idx < 0 or shot_idx >= len(self.report.screenshots):
+            self.issue_selector.blockSignals(False)
+            self._update_issue_selector_state(0, -1)
             return
 
         issues = self.report.screenshots[shot_idx].issues
@@ -1029,7 +1200,20 @@ class ReportEditorWindow(QMainWindow):
             preview = issue.wrong_text.strip().replace("\n", " ")
             if len(preview) > 60:
                 preview = preview[:57] + "..."
-            self.issue_list.addItem(f"{idx}. {preview}")
+            self.issue_selector.addItem(f"{idx}. {preview}")
+
+        self.issue_selector.blockSignals(False)
+        if issues:
+            self.issue_selector.setCurrentIndex(0)
+            self._update_issue_selector_state(len(issues), 0)
+        else:
+            self._update_issue_selector_state(0, -1)
+
+    def _update_issue_selector_state(self, total: int, current: int) -> None:
+        has_issues = total > 0 and current >= 0
+        self.btn_prev_issue.setEnabled(has_issues and current > 0)
+        self.btn_next_issue.setEnabled(has_issues and current < (total - 1))
+        self.issue_selector.setEnabled(total > 0)
 
     def _refresh_preview(self) -> None:
         shot_idx = self.screenshot_list.currentRow()

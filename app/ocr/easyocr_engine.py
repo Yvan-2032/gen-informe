@@ -45,7 +45,8 @@ def _normalize_language_name(value: str) -> str:
 def _map_easyocr_languages(source_language: str) -> list[str]:
     normalized = _normalize_language_name(source_language)
     mapping = {
-        "english": ["en"],
+        # Include Spanish as secondary to improve punctuation/accents in mixed UI text.
+        "english": ["en", "es"],
         "japanese": ["ja", "en"],
         "chinese_simple": ["ch_sim", "en"],
         "chinese_traditional": ["ch_tra", "en"],
@@ -153,12 +154,39 @@ class EasyOcrEngine(OcrEngine):
             return False
 
     def _read_text(self, reader, image_path: str) -> str:
-        try:
-            lines = reader.readtext(image_path, detail=0, paragraph=True)
-        except Exception as exc:  # noqa: BLE001
-            raise OcrRuntimeError(f"No se pudo ejecutar OCR sobre el recorte:\n{exc}") from exc
+        attempts = [
+            {"detail": 0, "paragraph": False, "decoder": "beamsearch"},
+            {
+                "detail": 0,
+                "paragraph": True,
+                "decoder": "beamsearch",
+                "contrast_ths": 0.05,
+                "adjust_contrast": 0.7,
+            },
+        ]
 
-        if not lines:
+        candidates: list[str] = []
+        last_error: Exception | None = None
+        for params in attempts:
+            try:
+                lines = reader.readtext(image_path, **params)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
+            normalized_lines = [str(line).strip() for line in lines if str(line).strip()]
+            if normalized_lines:
+                candidates.append("\n".join(normalized_lines))
+
+        if not candidates:
+            if last_error is not None:
+                raise OcrRuntimeError(
+                    f"No se pudo ejecutar OCR sobre el recorte:\n{last_error}"
+                ) from last_error
             return ""
-        normalized_lines = [str(line).strip() for line in lines if str(line).strip()]
-        return "\n".join(normalized_lines)
+
+        return max(candidates, key=self._candidate_score)
+
+    def _candidate_score(self, text: str) -> tuple[int, int, int]:
+        punctuation_bonus = sum(1 for ch in text if ch in ".,;:!?¿¡…")
+        accent_bonus = sum(1 for ch in text if ch in "áéíóúÁÉÍÓÚñÑüÜ")
+        return (len(text), punctuation_bonus, accent_bonus)
